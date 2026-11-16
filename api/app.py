@@ -43,6 +43,7 @@ DEFAULT_TRACKS = [
 ]
 
 ROOMS: dict[str, dict] = {}
+TRACK_CUSTOM_TITLES: dict[str, str] = {}
 
 
 def _now_kst_str() -> str:
@@ -150,6 +151,7 @@ def health():
         service="syncbeat-dj-listening-room",
         s3_bucket=S3_BUCKET,
         aws_region=AWS_REGION,
+        supported_formats=list(AUDIO_EXTENSIONS),
         active_rooms=len(ROOMS),
     )
 
@@ -169,10 +171,12 @@ def list_s3_tracks():
             if key.lower().endswith(AUDIO_EXTENSIONS):
                 encoded_key = quote(key, safe="/")
                 s3_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{encoded_key}"
+                filename = os.path.basename(key)
                 s3_items.append(
                     {
                         "id": f"s3-{key}",
-                        "title": os.path.basename(key),
+                        "title": TRACK_CUSTOM_TITLES.get(key) or filename,
+                        "filename": filename,
                         "artist": "AWS S3 음원",
                         "duration_sec": 180,
                         "url": s3_url,
@@ -199,12 +203,15 @@ def upload_s3_track():
     """[기능 2 확장 - 호스트 전용] 호스트가 직접 오디오 파일을 S3 버킷에 업로드합니다."""
     room_id = (request.form.get("room_id") or "").strip()
     session_id = (request.form.get("session_id") or "").strip()
+    custom_title = (request.form.get("custom_title") or "").strip()
 
     room = ROOMS.get(room_id)
     if not room:
         return jsonify(error="존재하지 않는 리스닝 룸입니다."), 404
     if session_id != room["host_session_id"]:
         return jsonify(error="호스트(DJ)만 음원을 업로드할 수 있습니다."), 403
+    if len(custom_title) > 60:
+        return jsonify(error="표시할 곡명은 60자 이내로 입력하세요."), 400
 
     if "file" not in request.files:
         return jsonify(error="업로드할 오디오 파일을 선택하세요."), 400
@@ -217,7 +224,7 @@ def upload_s3_track():
     ext = os.path.splitext(raw_name)[1].lower()
     if ext not in AUDIO_EXTENSIONS:
         return jsonify(
-            error=f"지원하지 않는 파일 형식입니다. ({', '.join(AUDIO_EXTENSIONS)} 파일만 가능)"
+            error=f"지원하지 않는 파일 형식입니다. 업로드 가능한 포맷: {', '.join(AUDIO_EXTENSIONS)}"
         ), 400
 
     safe_base = secure_filename(os.path.splitext(raw_name)[0]) or "track"
@@ -240,11 +247,15 @@ def upload_s3_track():
             s3_key,
             ExtraArgs={"ContentType": content_type_map.get(ext, "application/octet-stream")},
         )
+        if custom_title:
+            TRACK_CUSTOM_TITLES[s3_key] = custom_title
+        display_title = custom_title or raw_name
         s3_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{quote(s3_key, safe='/')}"
         return jsonify(
-            message=f"'{raw_name}' 파일이 S3에 업로드되었습니다!",
+            message=f"'{display_title}' 음원이 S3에 업로드되었습니다!",
             url=s3_url,
-            title=os.path.splitext(raw_name)[0],
+            title=display_title,
+            filename=raw_name,
             key=s3_key,
         ), 201
     except (NoCredentialsError, ClientError, BotoCoreError) as exc:
@@ -446,6 +457,8 @@ def update_playback(room_id: str):
         return jsonify(error="호스트(DJ)만 이 방의 음악과 재생 상태를 제어할 수 있습니다."), 403
 
     track_title = (data.get("track_title") or room["track_title"]).strip()
+    if len(track_title) > 60:
+        return jsonify(error="곡명은 60자 이내로 입력하세요."), 400
     track_artist = (data.get("track_artist") or room["track_artist"]).strip()
     audio_url = (data.get("audio_url") or room["audio_url"]).strip()
     action = (data.get("action") or "play").strip().lower()
@@ -487,11 +500,11 @@ def update_playback(room_id: str):
         "track_title": room["track_title"],
         "track_artist": room["track_artist"],
         "audio_url": room["audio_url"],
+        "duration_sec": room["duration_sec"],
         "is_playing": room["is_playing"],
         "current_position_sec": _calc_current_position(room),
         "server_time": round(now, 2),
     }
-    # WebSocket으로 방 내 모든 게스트에게 즉시 동기화 신호 전송
     socketio.emit("playback_sync", payload, to=room_id)
 
     return jsonify(message="재생 상태가 방 전체에 동기화되었습니다.", **payload)
@@ -531,7 +544,6 @@ def add_comment(room_id: str):
     }
     room["comments"].append(comment_item)
 
-    # WebSocket으로 방 내 모든 참여자에게 즉시 메시지 푸시
     socketio.emit("chat_message", {"room_id": room_id, "comment": comment_item}, to=room_id)
 
     return jsonify(
@@ -541,7 +553,6 @@ def add_comment(room_id: str):
     ), 201
 
 
-# --- WebSocket 이벤트 핸들러 ---
 @socketio.on("join_ws_room")
 def handle_join_ws_room(data):
     room_id = (data or {}).get("room_id")
