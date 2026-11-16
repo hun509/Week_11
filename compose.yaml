@@ -1,0 +1,29 @@
+name: syncbeat_project
+
+services:
+  api:
+    build: ./api
+    image: syncbeat_api:latest
+    container_name: syncbeat_api01
+    expose:
+      - "5000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as r; r.urlopen('http://127.0.0.1:5000/api/health', timeout=3)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  nginx:
+    build: ./nginx
+    image: syncbeat_web:latest
+    container_name: syncbeat_web01
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+networks:
+  default:
+    name: syncbeat_net01

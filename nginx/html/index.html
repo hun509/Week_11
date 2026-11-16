@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SyncBeat · 실시간 DJ 리스닝 룸</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div>
+        <span class="badge">CLOUD COMPUTING · AWS PROJECT</span>
+        <h1>SyncBeat : 실시간 DJ 음악 동시 감상 &amp; 타임스탬프 채팅</h1>
+        <p class="subtitle">호스트(DJ)가 선곡한 음악(`&lt;audio&gt;`)을 여러 참여자가 같은 재생 시점으로 함께 듣고 실시간 댓글을 남기는 웹서비스</p>
+      </div>
+      <div class="health-box">
+        <a href="/api/health" target="_blank" class="health-link">기본 연결 확인: /api/health</a>
+        <div id="healthStatus" class="status-pill">연결 확인 중...</div>
+      </div>
+    </div>
+  </header>
+
+  <main class="container main-grid">
+    <!-- 좌측: 기능 1 (리스닝 룸 생성 및 목록 선택) -->
+    <section class="card">
+      <div class="section-header">
+        <span class="step-tag">기능 1</span>
+        <h2>리스닝 룸 생성 · 입장</h2>
+      </div>
+      <p class="section-desc">새로운 DJ 리스닝 룸을 만들거나 현재 열려 있는 방에 입장합니다.</p>
+
+      <div class="form-group">
+        <label for="roomTitle">방 제목 (1~40자)</label>
+        <input id="roomTitle" type="text" placeholder="예: 시험기간 게임 OST 같이 듣는 방" />
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label for="roomHost">호스트(DJ) 닉네임 (1~20자)</label>
+          <input id="roomHost" type="text" placeholder="예: DJ정훈" value="DJ정훈" />
+        </div>
+        <div class="form-group">
+          <label for="roomMax">최대 정원 (2~200명)</label>
+          <input id="roomMax" type="number" value="30" min="1" max="300" />
+        </div>
+      </div>
+      <button id="createRoomBtn" class="btn primary">새 리스닝 룸 만들기</button>
+      <div id="createRoomResult" class="result-msg" aria-live="polite"></div>
+
+      <hr class="divider" />
+
+      <div class="list-header">
+        <h3>열려 있는 리스닝 룸 목록</h3>
+        <button id="refreshRoomsBtn" class="btn small">목록 새로고침</button>
+      </div>
+      <div id="roomList" class="room-list"></div>
+    </section>
+
+    <!-- 우측: 기능 2 (DJ 선곡 & <audio> 동기화) + 기능 3 (타임스탬프 댓글) -->
+    <section class="card">
+      <div class="room-banner">
+        <div>
+          <span class="room-id-badge" id="activeRoomId">room-kdu-01</span>
+          <h2 id="activeRoomTitle">밤 10시 코딩 &amp; 게임 브금 같이 듣기방</h2>
+          <p class="room-meta">
+            호스트: <strong id="activeRoomHost">DJ정훈</strong> ·
+            참여자: <strong id="activeRoomCount">2 / 50명</strong>
+          </p>
+        </div>
+        <button id="syncNowBtn" class="btn accent">⚡ 지금 서버 재생 시점에 동기화</button>
+      </div>
+
+      <!-- HTML5 <audio> 플레이어 영역 -->
+      <div class="player-box">
+        <div class="now-playing-info">
+          <span class="live-dot">LIVE SYNC</span>
+          <strong id="nowTrackTitle">Sunset Arcade Drive (Synthwave Loop)</strong>
+          <span id="nowTrackArtist" class="artist-text">- Cloud DJ Sample</span>
+        </div>
+
+        <audio id="audioPlayer" controls preload="metadata" loop src="/samples/sample_track_1.wav">
+          브라우저가 audio 태그를 지원하지 않습니다.
+        </audio>
+
+        <div class="sync-Readout">
+          <span>서버 기준 재생 시점: <strong id="serverPosText">0.0초</strong></span>
+          <span>내 플레이어 시점: <strong id="localPosText">0.0초</strong></span>
+          <span>상태: <strong id="playStateText">재생 중</strong></span>
+        </div>
+      </div>
+
+      <!-- 기능 2: DJ 선곡 및 S3 음원 URL / 재생 위치 변경 -->
+      <div class="sub-panel">
+        <div class="section-header">
+          <span class="step-tag">기능 2</span>
+          <h3>DJ 선곡 &amp; 재생 시점 브로드캐스트</h3>
+        </div>
+        <p class="section-desc">기본 내장 샘플 트랙을 고르거나 <strong>AWS S3에 업로드한 MP3/WAV 객체 URL</strong>을 입력해 방 전체의 재생 시점을 동기화합니다.</p>
+
+        <div class="form-group">
+          <label for="presetSelect">빠른 트랙 선택 (내장 샘플 또는 직접 S3 URL 입력)</label>
+          <select id="presetSelect">
+            <option value="/samples/sample_track_1.wav" data-title="Sunset Arcade Drive (Synthwave Loop)" data-artist="Cloud DJ Sample">
+              [내장 샘플 1] Sunset Arcade Drive (30초 루프)
+            </option>
+            <option value="/samples/sample_track_2.wav" data-title="Midnight Lo-Fi Coding Beats" data-artist="KDU Studio">
+              [내장 샘플 2] Midnight Lo-Fi Coding Beats (30초 루프)
+            </option>
+            <option value="custom">[AWS S3 객체 URL] 아래 입력칸에 직접 입력</option>
+          </select>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="trackTitleInput">곡 제목</label>
+            <input id="trackTitleInput" type="text" value="Sunset Arcade Drive (Synthwave Loop)" />
+          </div>
+          <div class="form-group">
+            <label for="seekSecInput">동기화 시작 위치 (초, 0~3600)</label>
+            <input id="seekSecInput" type="number" step="1" value="0" />
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="audioUrlInput">오디오 URL (`/samples/...` 또는 `https://버킷명.s3.리전.amazonaws.com/음원.mp3`)</label>
+          <input id="audioUrlInput" type="text" value="/samples/sample_track_1.wav" />
+        </div>
+
+        <div class="btn-row">
+          <button id="applyPlaybackBtn" class="btn primary">DJ 선곡 · 재생 시점 동기화 적용</button>
+          <button id="pausePlaybackBtn" class="btn secondary">전체 일시정지 신호 전송</button>
+        </div>
+        <div id="playbackResult" class="result-msg" aria-live="polite"></div>
+      </div>
+
+      <!-- 기능 3: 실시간 타임스탬프 감상 댓글 -->
+      <div class="sub-panel">
+        <div class="section-header">
+          <span class="step-tag">기능 3</span>
+          <h3>실시간 타임스탬프 감상 댓글</h3>
+        </div>
+        <p class="section-desc">댓글을 남기면 현재 서버에서 재생 중인 곡의 시점(예: <code>[00:12]</code>)이 자동으로 함께 기록됩니다.</p>
+
+        <div id="commentList" class="comment-list"></div>
+
+        <div class="comment-form">
+          <input id="commentNick" type="text" class="nick-input" placeholder="닉네임 (1~20자)" value="정훈" />
+          <input id="commentMsg" type="text" class="msg-input" placeholder="이 구간의 감상평이나 채팅을 입력하세요 (1~200자)" />
+          <button id="sendCommentBtn" class="btn primary">댓글 전송</button>
+        </div>
+        <div id="commentResult" class="result-msg" aria-live="polite"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class=" container footer">
+    <p>2026학년도 2학기 컴퓨터공학과 클라우드 컴퓨팅 AWS 프로젝트 · Nginx + Flask + Docker Compose + AWS (EC2 / S3)</p>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>
