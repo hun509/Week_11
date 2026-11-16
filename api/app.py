@@ -9,12 +9,19 @@ from urllib.parse import quote
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 from flask import Flask, jsonify, request
+from flask_socketio import SocketIO, emit, join_room as sio_join_room, leave_room as sio_leave_room
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024  # 최대 30MB 음원 업로드 허용
+
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 KST = timezone(timedelta(hours=9))
+S3_BUCKET = os.environ.get("S3_BUCKET", "kdu-2124066-11week").strip() or "kdu-2124066-11week"
+AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2").strip() or "ap-southeast-2"
 AUDIO_EXTENSIONS = (".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac")
-SESSION_TIMEOUT_SEC = 12.0  # 12초 이상 폴링/하트비트가 없으면 접속 종료로 간주
+SESSION_TIMEOUT_SEC = 15.0
 
 DEFAULT_TRACKS = [
     {
@@ -35,7 +42,6 @@ DEFAULT_TRACKS = [
     },
 ]
 
-# 인메모리 리스닝 룸 저장소
 ROOMS: dict[str, dict] = {}
 
 
@@ -44,7 +50,6 @@ def _now_kst_str() -> str:
 
 
 def _prune_inactive_listeners(room: dict) -> None:
-    """일정 시간(SESSION_TIMEOUT_SEC) 동안 응답이 없는 참여자 세션을 정리해 정확한 접속 인원을 유지합니다."""
     now = time.time()
     sessions: dict[str, dict] = room.setdefault("sessions", {})
     expired = [
@@ -64,6 +69,43 @@ def _calc_current_position(room: dict) -> float:
     if duration > 0:
         return round(elapsed % duration, 2)
     return round(elapsed, 2)
+
+
+def _room_snapshot(room: dict, session_id: str = "", sort_by: str = "real_time") -> dict:
+    _prune_inactive_listeners(room)
+    comments = list(room["comments"])
+    if sort_by == "track_time":
+        comments.sort(
+            key=lambda c: (
+                float(c.get("track_timestamp_sec", 0.0)),
+                float(c.get("created_at_epoch", 0.0)),
+            )
+        )
+    else:
+        comments.sort(key=lambda c: float(c.get("created_at_epoch", 0.0)))
+
+    listeners_info = [
+        {"nickname": v["nickname"], "role": v["role"]}
+        for v in room["sessions"].values()
+    ]
+
+    return {
+        "room_id": room["room_id"],
+        "title": room["title"],
+        "host": room["host"],
+        "is_host": (session_id == room["host_session_id"]),
+        "listeners": listeners_info,
+        "listener_count": len(listeners_info),
+        "max_listeners": room["max_listeners"],
+        "track_title": room["track_title"],
+        "track_artist": room["track_artist"],
+        "audio_url": room["audio_url"],
+        "duration_sec": room["duration_sec"],
+        "is_playing": room["is_playing"],
+        "current_position_sec": _calc_current_position(room),
+        "server_time": round(time.time(), 2),
+        "comments": comments[-100:],
+    }
 
 
 def _seed_initial_room() -> None:
@@ -87,9 +129,9 @@ def _seed_initial_room() -> None:
         "comments": [
             {
                 "id": "c-1",
-                "nickname": "DJ정훈",
-                "role": "host",
-                "message": "게스트로 입장하신 뒤 '오디오 동기화 켜기'를 한 번 누르면 DJ 재생 상태에 맞춰 자동 동기화됩니다!",
+                "nickname": "시스템",
+                "role": "system",
+                "message": "실시간 WebSocket 채팅방이 열렸습니다! 호스트가 방을 만들거나 게스트로 입장해 보세요.",
                 "track_timestamp_sec": 0.0,
                 "created_at_epoch": now,
                 "created_at": _now_kst_str(),
@@ -106,59 +148,109 @@ def health():
     return jsonify(
         status="ok",
         service="syncbeat-dj-listening-room",
+        s3_bucket=S3_BUCKET,
+        aws_region=AWS_REGION,
         active_rooms=len(ROOMS),
-        s3_bucket_configured=bool(os.environ.get("S3_BUCKET", "").strip()),
     )
 
 
 @app.get("/api/s3/tracks")
 def list_s3_tracks():
-    """
-    AWS S3 버킷 내 오디오 파일 목록을 조회해 반환합니다.
-    - EC2 IAM 역할(또는 환경변수 자격증명)과 버킷 이름을 사용해 S3 ListObjectsV2 호출
-    - S3 미설정/권한 부족 시에도 내장 샘플 음원과 함께 안내 메시지를 반환해 서비스가 중단되지 않음
-    """
-    bucket = (request.args.get("bucket") or os.environ.get("S3_BUCKET") or "").strip()
-    region = (request.args.get("region") or os.environ.get("AWS_REGION") or "ap-southeast-2").strip()
-
+    """고정된 S3 버킷(kdu-2124066-11week, ap-southeast-2)에서 오디오 파일 목록을 조회합니다."""
     s3_items: list[dict] = []
-    s3_status = "미설정 (기본 내장 샘플 사용 중)"
+    s3_status = "S3 연결 대기"
     s3_error = None
 
-    if bucket:
-        try:
-            s3 = boto3.client("s3", region_name=region)
-            resp = s3.list_objects_v2(Bucket=bucket, MaxKeys=100)
-            for obj in resp.get("Contents", []):
-                key = obj.get("Key", "")
-                if key.lower().endswith(AUDIO_EXTENSIONS):
-                    encoded_key = quote(key, safe="/")
-                    s3_url = f"https://{bucket}.s3.{region}.amazonaws.com/{encoded_key}"
-                    s3_items.append(
-                        {
-                            "id": f"s3-{key}",
-                            "title": f"[S3] {os.path.basename(key)}",
-                            "artist": f"S3 Bucket: {bucket}",
-                            "duration_sec": 180,
-                            "url": s3_url,
-                            "source": "AWS S3",
-                            "size_kb": round(obj.get("Size", 0) / 1024, 1),
-                        }
-                    )
-            s3_status = f"연결 성공 ({len(s3_items)}개 음원 발견)"
-        except (NoCredentialsError, ClientError, BotoCoreError) as exc:
-            s3_status = "S3 조회 실패 (IAM 역할 또는 버킷 이름·리전 확인 필요)"
-            s3_error = str(exc)
+    try:
+        s3 = boto3.client("s3", region_name=AWS_REGION)
+        resp = s3.list_objects_v2(Bucket=S3_BUCKET, MaxKeys=100)
+        for obj in resp.get("Contents", []):
+            key = obj.get("Key", "")
+            if key.lower().endswith(AUDIO_EXTENSIONS):
+                encoded_key = quote(key, safe="/")
+                s3_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{encoded_key}"
+                s3_items.append(
+                    {
+                        "id": f"s3-{key}",
+                        "title": os.path.basename(key),
+                        "artist": "AWS S3 음원",
+                        "duration_sec": 180,
+                        "url": s3_url,
+                        "source": "AWS S3",
+                        "size_kb": round(obj.get("Size", 0) / 1024, 1),
+                    }
+                )
+        s3_status = f"S3 연결됨 ({len(s3_items)}개 음원)"
+    except (NoCredentialsError, ClientError, BotoCoreError) as exc:
+        s3_status = "S3 목록 조회 실패 (IAM 권한 또는 버킷 확인)"
+        s3_error = str(exc)
 
     return jsonify(
-        bucket=bucket,
-        region=region,
         s3_status=s3_status,
         s3_error=s3_error,
         s3_tracks=s3_items,
         default_tracks=DEFAULT_TRACKS,
         items=s3_items + DEFAULT_TRACKS,
     )
+
+
+@app.post("/api/s3/upload")
+def upload_s3_track():
+    """[기능 2 확장 - 호스트 전용] 호스트가 직접 오디오 파일을 S3 버킷에 업로드합니다."""
+    room_id = (request.form.get("room_id") or "").strip()
+    session_id = (request.form.get("session_id") or "").strip()
+
+    room = ROOMS.get(room_id)
+    if not room:
+        return jsonify(error="존재하지 않는 리스닝 룸입니다."), 404
+    if session_id != room["host_session_id"]:
+        return jsonify(error="호스트(DJ)만 음원을 업로드할 수 있습니다."), 403
+
+    if "file" not in request.files:
+        return jsonify(error="업로드할 오디오 파일을 선택하세요."), 400
+
+    file = request.files["file"]
+    if not file or not file.filename:
+        return jsonify(error="선택된 파일이 없습니다."), 400
+
+    raw_name = file.filename
+    ext = os.path.splitext(raw_name)[1].lower()
+    if ext not in AUDIO_EXTENSIONS:
+        return jsonify(
+            error=f"지원하지 않는 파일 형식입니다. ({', '.join(AUDIO_EXTENSIONS)} 파일만 가능)"
+        ), 400
+
+    safe_base = secure_filename(os.path.splitext(raw_name)[0]) or "track"
+    s3_key = f"uploads/{int(time.time())}_{safe_base}{ext}"
+
+    content_type_map = {
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".ogg": "audio/ogg",
+        ".m4a": "audio/mp4",
+        ".aac": "audio/aac",
+        ".flac": "audio/flac",
+    }
+
+    try:
+        s3 = boto3.client("s3", region_name=AWS_REGION)
+        s3.upload_fileobj(
+            file.stream,
+            S3_BUCKET,
+            s3_key,
+            ExtraArgs={"ContentType": content_type_map.get(ext, "application/octet-stream")},
+        )
+        s3_url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{quote(s3_key, safe='/')}"
+        return jsonify(
+            message=f"'{raw_name}' 파일이 S3에 업로드되었습니다!",
+            url=s3_url,
+            title=os.path.splitext(raw_name)[0],
+            key=s3_key,
+        ), 201
+    except (NoCredentialsError, ClientError, BotoCoreError) as exc:
+        return jsonify(
+            error=f"S3 업로드 실패: IAM 역할(week8-role)에 S3 쓰기 권한(AmazonS3FullAccess 등)이 있는지 확인하세요. ({exc})"
+        ), 500
 
 
 @app.get("/api/rooms")
@@ -175,7 +267,6 @@ def list_rooms():
                 "max_listeners": room["max_listeners"],
                 "track_title": room["track_title"],
                 "is_playing": room["is_playing"],
-                "current_position_sec": _calc_current_position(room),
                 "comment_count": len(room["comments"]),
             }
         )
@@ -184,9 +275,7 @@ def list_rooms():
 
 @app.post("/api/rooms")
 def create_room():
-    """
-    [기능 1 - 호스트] 리스닝 룸 생성
-    """
+    """[기능 1 - 호스트] 리스닝 룸 생성"""
     data = request.get_json(silent=True) or {}
     title = (data.get("title") or "").strip()
     host = (data.get("host") or "").strip()
@@ -219,11 +308,7 @@ def create_room():
         "host_session_id": session_id,
         "max_listeners": max_listeners,
         "sessions": {
-            session_id: {
-                "nickname": host,
-                "role": "host",
-                "last_seen": now,
-            }
+            session_id: {"nickname": host, "role": "host", "last_seen": now}
         },
         "track_title": DEFAULT_TRACKS[0]["title"],
         "track_artist": DEFAULT_TRACKS[0]["artist"],
@@ -233,7 +318,17 @@ def create_room():
         "started_at": now,
         "paused_position": 0.0,
         "created_at": _now_kst_str(),
-        "comments": [],
+        "comments": [
+            {
+                "id": "c-init",
+                "nickname": "시스템",
+                "role": "system",
+                "message": f"{host}님이 '{title}' 리스닝 룸을 열었습니다.",
+                "track_timestamp_sec": 0.0,
+                "created_at_epoch": now,
+                "created_at": _now_kst_str(),
+            }
+        ],
     }
     ROOMS[room_id] = room
     return jsonify(
@@ -247,10 +342,8 @@ def create_room():
 
 
 @app.post("/api/rooms/<room_id>/join")
-def join_room(room_id: str):
-    """
-    [기능 1 - 게스트] 선택한 리스닝 룸에 닉네임으로 입장
-    """
+def join_room_api(room_id: str):
+    """[기능 1 - 게스트] 선택한 리스닝 룸 입장"""
     room = ROOMS.get(room_id)
     if not room:
         return jsonify(error="존재하지 않는 리스닝 룸입니다."), 404
@@ -269,12 +362,28 @@ def join_room(room_id: str):
     if session_id not in sessions and len(sessions) >= room["max_listeners"]:
         return jsonify(error="방 정원이 가득 차서 입장할 수 없습니다."), 409
 
+    is_new_join = session_id not in sessions
     role = "host" if session_id == room["host_session_id"] else "guest"
     sessions[session_id] = {
         "nickname": nickname,
         "role": role,
         "last_seen": time.time(),
     }
+
+    if is_new_join:
+        now = time.time()
+        sys_msg = {
+            "id": f"c-{len(room['comments']) + 1}",
+            "nickname": "시스템",
+            "role": "system",
+            "message": f"🙋 {nickname}님이 입장했습니다.",
+            "track_timestamp_sec": _calc_current_position(room),
+            "created_at_epoch": now,
+            "created_at": _now_kst_str(),
+        }
+        room["comments"].append(sys_msg)
+        socketio.emit("chat_message", {"room_id": room_id, "comment": sys_msg}, to=room_id)
+        socketio.emit("room_updated", _room_snapshot(room, ""), to=room_id)
 
     return jsonify(
         message=f"'{room['title']}' 방에 입장했습니다.",
@@ -286,14 +395,15 @@ def join_room(room_id: str):
 
 
 @app.post("/api/rooms/<room_id>/leave")
-def leave_room(room_id: str):
+def leave_room_api(room_id: str):
     room = ROOMS.get(room_id)
     if not room:
         return jsonify(ok=True)
     data = request.get_json(silent=True) or {}
     session_id = (data.get("session_id") or "").strip()
-    if session_id:
-        room.get("sessions", {}).pop(session_id, None)
+    if session_id and session_id in room.get("sessions", {}):
+        room["sessions"].pop(session_id, None)
+        socketio.emit("room_updated", _room_snapshot(room, ""), to=room_id)
     return jsonify(ok=True)
 
 
@@ -303,14 +413,12 @@ def get_room(room_id: str):
     if not room:
         return jsonify(error="존재하지 않는 리스닝 룸입니다."), 404
 
-    _prune_inactive_listeners(room)
-
     session_id = (request.args.get("session_id") or "").strip()
     nickname = (request.args.get("nickname") or "").strip()
     role = (request.args.get("role") or "guest").strip()
     sort_by = (request.args.get("sort") or "real_time").strip()
 
-    # 활성 참여자 세션 하트비트 갱신 (정확한 인원 집계)
+    _prune_inactive_listeners(room)
     if session_id and nickname:
         sessions = room["sessions"]
         if session_id in sessions or len(sessions) < room["max_listeners"]:
@@ -321,41 +429,12 @@ def get_room(room_id: str):
                 "last_seen": time.time(),
             }
 
-    comments = list(room["comments"])
-    if sort_by == "track_time":
-        comments.sort(key=lambda c: (float(c.get("track_timestamp_sec", 0.0)), float(c.get("created_at_epoch", 0.0))))
-    else:
-        comments.sort(key=lambda c: float(c.get("created_at_epoch", 0.0)))
-
-    listeners_info = [
-        {"nickname": v["nickname"], "role": v["role"]}
-        for v in room["sessions"].values()
-    ]
-
-    return jsonify(
-        room_id=room["room_id"],
-        title=room["title"],
-        host=room["host"],
-        is_host=(session_id == room["host_session_id"]),
-        listeners=listeners_info,
-        listener_count=len(listeners_info),
-        max_listeners=room["max_listeners"],
-        track_title=room["track_title"],
-        track_artist=room["track_artist"],
-        audio_url=room["audio_url"],
-        duration_sec=room["duration_sec"],
-        is_playing=room["is_playing"],
-        current_position_sec=_calc_current_position(room),
-        server_time=round(time.time(), 2),
-        comments=comments[-100:],
-    )
+    return jsonify(_room_snapshot(room, session_id=session_id, sort_by=sort_by))
 
 
 @app.post("/api/rooms/<room_id>/playback")
 def update_playback(room_id: str):
-    """
-    [기능 2 - 호스트 전용] DJ 선곡(S3 음원 또는 샘플) 및 재생/일시정지/탐색 시점 브로드캐스트
-    """
+    """[기능 2 - 호스트 전용] DJ 선곡 및 재생/일시정지/탐색 시점 실시간 WebSocket 브로드캐스트"""
     room = ROOMS.get(room_id)
     if not room:
         return jsonify(error="존재하지 않는 리스닝 룸입니다."), 404
@@ -403,22 +482,24 @@ def update_playback(room_id: str):
         room["started_at"] = now - seek_sec
         room["paused_position"] = seek_sec
 
-    return jsonify(
-        message="재생 상태가 방 전체에 동기화되었습니다.",
-        room_id=room_id,
-        track_title=room["track_title"],
-        audio_url=room["audio_url"],
-        is_playing=room["is_playing"],
-        current_position_sec=_calc_current_position(room),
-        server_time=round(now, 2),
-    )
+    payload = {
+        "room_id": room_id,
+        "track_title": room["track_title"],
+        "track_artist": room["track_artist"],
+        "audio_url": room["audio_url"],
+        "is_playing": room["is_playing"],
+        "current_position_sec": _calc_current_position(room),
+        "server_time": round(now, 2),
+    }
+    # WebSocket으로 방 내 모든 게스트에게 즉시 동기화 신호 전송
+    socketio.emit("playback_sync", payload, to=room_id)
+
+    return jsonify(message="재생 상태가 방 전체에 동기화되었습니다.", **payload)
 
 
 @app.post("/api/rooms/<room_id>/comments")
 def add_comment(room_id: str):
-    """
-    [기능 3 - 호스트/게스트 공용] 실시간 타임스탬프 감상 댓글 (실제 시각 KST + 곡 재생 시점 동시 기록)
-    """
+    """[기능 3] 실시간 WebSocket 채팅 메시지 등록 및 브로드캐스트"""
     room = ROOMS.get(room_id)
     if not room:
         return jsonify(error="존재하지 않는 리스닝 룸입니다."), 404
@@ -432,11 +513,11 @@ def add_comment(room_id: str):
     role = session_info["role"] if session_info else ("host" if session_id == room["host_session_id"] else "guest")
 
     if not nickname:
-        return jsonify(error="먼저 기능 1에서 호스트 방을 생성하거나 게스트로 닉네임을 입력해 입장하세요."), 400
+        return jsonify(error="먼저 기능 1에서 호스트 방을 생성하거나 게스트로 입장하세요."), 400
     if not message:
-        return jsonify(error="댓글 내용을 입력하세요."), 400
+        return jsonify(error="채팅 내용을 입력하세요."), 400
     if len(message) > 200:
-        return jsonify(error="댓글은 200자 이내로 입력하세요."), 400
+        return jsonify(error="채팅은 200자 이내로 입력하세요."), 400
 
     now = time.time()
     comment_item = {
@@ -450,13 +531,32 @@ def add_comment(room_id: str):
     }
     room["comments"].append(comment_item)
 
+    # WebSocket으로 방 내 모든 참여자에게 즉시 메시지 푸시
+    socketio.emit("chat_message", {"room_id": room_id, "comment": comment_item}, to=room_id)
+
     return jsonify(
-        message="댓글이 등록되었습니다.",
+        message="채팅이 전송되었습니다.",
         comment=comment_item,
         total_comments=len(room["comments"]),
     ), 201
 
 
+# --- WebSocket 이벤트 핸들러 ---
+@socketio.on("join_ws_room")
+def handle_join_ws_room(data):
+    room_id = (data or {}).get("room_id")
+    if room_id:
+        sio_join_room(room_id)
+        emit("ws_status", {"connected": True, "room_id": room_id})
+
+
+@socketio.on("leave_ws_room")
+def handle_leave_ws_room(data):
+    room_id = (data or {}).get("room_id")
+    if room_id:
+        sio_leave_room(room_id)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    socketio.run(app, host="0.0.0.0", port=port, allow_unsafe_werkzeug=True)
